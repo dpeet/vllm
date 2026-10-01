@@ -13,6 +13,9 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
 
+from .ngram_embedding import Qwen4ExpNGramEmbedding
+from .ple_disk import Qwen4ExpPLEDiskEmbedding, ple_staged_enabled
+
 
 class Qwen4ExpModelState(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
@@ -63,6 +66,17 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        # Disk-backed PLE tables (QWEN4EXP_PLE_STAGED=1) get their rows gathered
+        # here, on the host before the forward or FULL graph replay, into a
+        # fixed buffer the graph reads (see ple_disk.py).
+        self.staged_ple: list[Qwen4ExpNGramEmbedding] = []
+        if ple_staged_enabled():
+            for module in model.modules():
+                if isinstance(module, Qwen4ExpNGramEmbedding) and isinstance(
+                    module.ngram_embedding, Qwen4ExpPLEDiskEmbedding
+                ):
+                    module.init_disk_staging(self.max_num_tokens, self.device)
+                    self.staged_ple.append(module)
 
     def _prepare_ngram_context(
         self,
@@ -106,10 +120,27 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
         # Represent unused capacity as trailing zero-length requests.
         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
+        if self.staged_ple:
+            num_reqs = input_batch.num_reqs
+            # Dummy/profile batches have no prompt: stage zeros, skip the table.
+            is_real = (
+                num_reqs > 0 and int(input_batch.prefill_len_np[:num_reqs].max()) > 0
+            )
+            num_tokens = input_batch.num_tokens if is_real else 0
+            padded_tokens = input_batch.num_tokens_after_padding
+            for module in self.staged_ple:
+                module.stage_disk_rows(
+                    input_batch.input_ids[:padded_tokens],
+                    query_start_loc,
+                    ngram_context,
+                    num_tokens,
+                    padded_tokens,
+                )
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -141,6 +172,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        for module in self.staged_ple:
+            # Capture time: no host-side gather may be queued here.
+            module.stage_disk_zero(num_tokens)
         return model_inputs
 
 

@@ -13,14 +13,20 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
     multi stream [T, hc_count*H] (fed to the next draft step).
 """
 
+import os
 from collections.abc import Iterable
 
 import regex as re
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vllm.config import VllmConfig, replace, set_current_vllm_config
-from vllm.distributed import get_pp_group
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -359,6 +365,14 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=mapper)
 
 
+def _draft_vocab_size() -> int:
+    """QWEN4EXP_DRAFT_VOCAB: draft only token ids [0, K); 0 or unset = off."""
+    try:
+        return int(os.environ.get("QWEN4EXP_DRAFT_VOCAB", "0"))
+    except ValueError:
+        return 0
+
+
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -434,7 +448,54 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        vocab_limit = _draft_vocab_size()
+        if vocab_limit <= 0 or not hasattr(self.lm_head, "weight"):
+            return self.logits_processor(self.lm_head, hidden_states)
+        return self._reduced_vocab_logits(hidden_states, vocab_limit)
+
+    def _reduced_vocab_logits(
+        self, hidden_states: torch.Tensor, vocab_limit: int
+    ) -> torch.Tensor:
+        """Draft logits for token ids [0, vocab_limit) only; the rest are -inf.
+
+        The draft lm_head matmul is memory-bound, so scoring only the lowest
+        ids (BPE merge order as a frequency proxy, after FR-Spec) cuts its
+        weight read by 1 - K/V. The target still verifies every draft over the
+        full vocabulary, so outputs are unchanged; only acceptance can move.
+        Each TP rank scores the rows of its vocab slice below the limit and
+        the ranks sum (each column has one owner); the result is widened to
+        the full vocabulary so the speculator's argmax yields global ids.
+        """
+        head = self.lm_head
+        cache = getattr(self, "_draft_vocab_cache", None)
+        if cache is None or cache[0] != vocab_limit:
+            start = int(head.shard_indices.org_vocab_start_index)
+            end = int(head.shard_indices.org_vocab_end_index)
+            low, high = max(start, 0), min(end, vocab_limit)
+            head_weight = head.weight
+            assert isinstance(head_weight, torch.Tensor)
+            weight = (
+                head_weight[low - start : high - start].contiguous()
+                if high > low
+                else None
+            )
+            cache = (vocab_limit, low, high, weight)
+            self._draft_vocab_cache = cache
+        _, low, high, weight = cache
+        num_tokens = hidden_states.shape[0]
+        small = hidden_states.new_zeros((num_tokens, vocab_limit))
+        if weight is not None:
+            small[:, low:high] = F.linear(hidden_states.to(weight.dtype), weight).to(
+                small.dtype
+            )
+        if get_tensor_model_parallel_world_size() > 1:
+            small = tensor_model_parallel_all_reduce(small)
+        full = small.new_full((num_tokens, int(self.config.vocab_size)), float("-inf"))
+        full[:, :vocab_limit] = small
+        scale = getattr(self.logits_processor, "scale", 1.0)
+        if scale != 1.0:
+            full.mul_(scale)
+        return full
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():

@@ -27,6 +27,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -63,6 +64,8 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+
+logger = init_logger(__name__)
 
 
 def _remap_ignored_layers(
@@ -416,6 +419,13 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             raise ValueError(
                 f"QWEN4EXP_DRAFT_VOCAB={draft_vocab} exceeds the vocabulary "
                 f"size {config.vocab_size}"
+            )
+        if draft_vocab > 0:
+            logger.info(
+                "Qwen4Exp MTP: reduced draft vocabulary active, drafting token ids "
+                "[0, %d) of %d (QWEN4EXP_DRAFT_VOCAB)",
+                draft_vocab,
+                int(config.vocab_size),
             )
         self.model = Qwen4ExpMultiTokenPredictor(
             vllm_config=vllm_config,

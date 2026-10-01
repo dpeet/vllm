@@ -137,8 +137,18 @@ class PLEDiskTable:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"PLE disk: shard file missing: {path}")
             header, data_start = _read_header(path)
+            file_size = os.path.getsize(path)
             for name, meta in header.items():
                 begin, end = meta["data_offsets"]
+                if (scale_re.search(name) or shard_re.search(name)) and (
+                    data_start + end > file_size
+                ):
+                    # A partial download otherwise boots fine and the first request that
+                    # touches a missing row kills the engine with a short read.
+                    raise ValueError(
+                        f"PLE disk: {path} is truncated: {name} ends at byte "
+                        f"{data_start + end} but the file has {file_size}"
+                    )
                 if scale_re.search(name):
                     self.scale_entry = (
                         path,
@@ -204,6 +214,10 @@ class PLEDiskTable:
         # thread count), while preadv scales with the NVMe queue depth.
         self.threads = threads or max(8, min(48, 2 * (os.cpu_count() or 8)))
         self.chunk_rows = int(os.environ.get("QWEN4EXP_PLE_MMAP_CHUNK", "8"))
+        if self.chunk_rows < 1:
+            raise ValueError(
+                f"QWEN4EXP_PLE_MMAP_CHUNK must be >= 1, got {self.chunk_rows}"
+            )
         self._fds: dict[str, int] = {}
         self.shard_base: dict[int, tuple[int, int]] = {
             index: (self._open(path), offset)
@@ -368,8 +382,18 @@ class Qwen4ExpPLEDiskEmbedding(nn.Module):
 
     def verify_loaded(self) -> None:
         """Fail closed when an FP8 table's global scale never arrived."""
-        if self.is_fp8 and bool(torch.isnan(self.weight_scale)):
+        if not self.is_fp8:
+            return
+        if bool(torch.isnan(self.weight_scale)):
             raise ValueError("FP8 PLE checkpoint is missing its global scale")
+        # A zero, negative or infinite scale would silently zero or blow up
+        # every PLE embedding.
+        scale = float(self.weight_scale)
+        if not (math.isfinite(scale) and scale > 0.0):
+            raise ValueError(
+                "FP8 PLE checkpoint global scale must be finite and positive, "
+                f"got {scale}"
+            )
 
     def start_prefetch(
         self,

@@ -73,9 +73,16 @@ def ple_staged_enabled() -> bool:
     return ple_disk_enabled() and _env_flag("QWEN4EXP_PLE_STAGED")
 
 
+_MAX_HEADER_BYTES = 256 * 1024 * 1024  # safetensors' own limit is 100 MB
+
+
 def _read_header(path: str) -> tuple[dict, int]:
     with open(path, "rb") as f:
         header_len = struct.unpack("<Q", f.read(8))[0]
+        if header_len > min(_MAX_HEADER_BYTES, os.path.getsize(path) - 8):
+            raise ValueError(
+                f"PLE disk: {path} has an invalid header length {header_len}"
+            )
         header = json.loads(f.read(header_len))
     header.pop("__metadata__", None)
     return header, 8 + header_len
@@ -148,6 +155,13 @@ class PLEDiskTable:
             file_size = os.path.getsize(path)
             for name, meta in header.items():
                 begin, end = meta["data_offsets"]
+                if (scale_re.search(name) or shard_re.search(name)) and not (
+                    0 <= begin <= end
+                ):
+                    raise ValueError(
+                        f"PLE disk: {path}: {name} has invalid data_offsets "
+                        f"[{begin}, {end}]"
+                    )
                 if (scale_re.search(name) or shard_re.search(name)) and (
                     data_start + end > file_size
                 ):
@@ -394,6 +408,9 @@ class Qwen4ExpPLEDiskEmbedding(nn.Module):
     def verify_loaded(self) -> None:
         """Fail closed when an FP8 table's global scale never arrived."""
         if not self.is_fp8:
+            self._verified = (
+                True  # BF16 tables have no scale; the flag also arms the reload guard
+            )
             return
         if bool(torch.isnan(self.weight_scale)):
             raise ValueError("FP8 PLE checkpoint is missing its global scale")

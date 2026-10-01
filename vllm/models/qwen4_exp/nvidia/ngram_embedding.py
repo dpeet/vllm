@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -27,6 +28,7 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
 from ..common.ops.ple import ple_ngram_ids
+from .ple_disk import Qwen4ExpPLEDiskEmbedding, ple_disk_enabled
 
 logger = init_logger(__name__)
 
@@ -210,29 +212,63 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
             self.use_sequence_parallel
             and get_etp_group().world_size == get_tp_group().world_size
         )
-        self.ngram_embedding = embedding_cls(
-            padded_vocab_size,
-            self.head_dim,
-            params_dtype=params_dtype,
-            padding_size=divisor,
-            prefix=embedding_prefix,
-            embedding_method=embedding_quant_method,
-            num_ngram_heads=self.ngram_heads,
-            max_total_tokens=max_total_tokens,
-            data_parallel_rank=data_parallel_rank,
-            reduce_results=not self.use_reduce_scatter,
-        )
+        self.ngram_embedding: Qwen4ExpPLEEmbedding | Qwen4ExpPLEDiskEmbedding
+        if ple_disk_enabled():
+            # Checked before the pinned/device choice so the full table is
+            # never allocated, whatever the engram cpu_offload default says.
+            if self.use_sequence_parallel:
+                # The staged forward returns full-token rows before the SP
+                # shard, so sequence parallelism would get unsharded rows.
+                raise ValueError(
+                    "QWEN4EXP_PLE_MMAP=1 does not support sequence parallelism "
+                    f"({embedding_prefix})"
+                )
+            if engram_config is not None and engram_config.cpu_offload:
+                logger.warning(
+                    "QWEN4EXP_PLE_MMAP=1 overrides engram cpu_offload for %s",
+                    embedding_prefix,
+                )
+            model_dir = os.environ.get("QWEN4EXP_PLE_MODEL_DIR") or str(
+                vllm_config.model_config.model
+            )
+            self.ngram_embedding = Qwen4ExpPLEDiskEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                prefix=embedding_prefix,
+                model_dir=model_dir,
+                split_parts=self.split_ngram_parts,
+                expected_dtype=(
+                    torch.float8_e4m3fn
+                    if isinstance(embedding_quant_method, Qwen4ExpPLEFp8EmbeddingMethod)
+                    else params_dtype
+                ),
+                reduce_results=not self.use_reduce_scatter,
+            )
+        else:
+            embedding_cls = (
+                Qwen4ExpPLEPinnedHostEmbedding
+                if engram_config is not None and engram_config.cpu_offload
+                else Qwen4ExpPLEDeviceEmbedding
+            )
+            self.ngram_embedding = embedding_cls(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype=params_dtype,
+                padding_size=divisor,
+                prefix=embedding_prefix,
+                embedding_method=embedding_quant_method,
+                num_ngram_heads=self.ngram_heads,
+                max_total_tokens=max_total_tokens,
+                data_parallel_rank=data_parallel_rank,
+                reduce_results=not self.use_reduce_scatter,
+            )
         if self.ngram_embedding.supports_prefetch:
             # The side-stream lookup outlives eager-break args, whose
             # graph-pool storage later segments may reuse.
@@ -380,6 +416,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Return full embeddings or a token shard after combining vocabulary owners."""
         embedding = self.ngram_embedding
+        if isinstance(embedding, Qwen4ExpPLEDiskEmbedding) and embedding.is_staged:
+            # Rows were staged before this forward (or graph replay); only a
+            # view of the fixed buffer here, so the forward stays graph-safe.
+            num_tokens = input_ids.reshape(-1).shape[0]
+            return embedding.staged_rows(num_tokens * self.ngram_heads).view(
+                num_tokens, self.ngram_heads * self.head_dim
+            )
         if embedding.supports_prefetch:
             # Prefetch contains full tokens even when hidden states are sharded.
             embeddings = embedding.finalize_prefetch(total_tokens=input_ids.shape[0])
@@ -410,6 +453,41 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         embedding.start_prefetch(ngram_ids)
 
+    def init_disk_staging(self, max_num_tokens: int, device: torch.device) -> None:
+        """Allocate the fixed staging buffer of a disk-backed table."""
+        embedding = self.ngram_embedding
+        if not isinstance(embedding, Qwen4ExpPLEDiskEmbedding):
+            raise TypeError("PLE staging requires the disk-backed table")
+        embedding.init_staging(max_num_tokens * self.ngram_heads, device)
+
+    def stage_disk_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        num_tokens: int,
+        padded_tokens: int,
+    ) -> None:
+        """Gather this step's rows for the first ``num_tokens`` tokens.
+
+        Padding tokens up to ``padded_tokens`` get zero rows; a step with no
+        real tokens (profile/dummy batches) never touches the table.
+        """
+        embedding = self.ngram_embedding
+        assert isinstance(embedding, Qwen4ExpPLEDiskEmbedding)
+        heads = self.ngram_heads
+        if num_tokens <= 0:
+            embedding.stage_zero(padded_tokens * heads)
+            return
+        ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+        embedding.stage_rows(ngram_ids[:num_tokens], padded_tokens * heads)
+
+    def stage_disk_zero(self, num_tokens: int) -> None:
+        """Zero the staged rows (capture time: no host work may be queued)."""
+        embedding = self.ngram_embedding
+        assert isinstance(embedding, Qwen4ExpPLEDiskEmbedding)
+        embedding.stage_zero(num_tokens * self.ngram_heads)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
         persistent_buffers = {
@@ -420,11 +498,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
+        disk_embedding = (
+            self.ngram_embedding
+            if isinstance(self.ngram_embedding, Qwen4ExpPLEDiskEmbedding)
+            else None
+        )
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
                 continue
+            if disk_embedding is not None:
+                # Rows are served from the checkpoint files (validated when the
+                # table opened); only the FP8 global scale is kept in memory.
+                if name.startswith(shard_prefix) and name.endswith(".weight"):
+                    loaded.add("ngram_embedding.weight")
+                    continue
+                if name == "ngram_embedding.weight_scale":
+                    disk_embedding.load_scale(loaded_weight)
+                    loaded.add(name)
+                    continue
             if name in persistent_buffers:
                 buffer = persistent_buffers[name]
                 if buffer.shape != loaded_weight.shape:
@@ -473,4 +566,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        if disk_embedding is not None:
+            disk_embedding.verify_loaded()
         return loaded

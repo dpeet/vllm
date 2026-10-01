@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -18,10 +19,15 @@ from .ngram_embedding import (
     Qwen4ExpPLEDiskOffloadEmbedding,
     stage_checkpoint_rows,
 )
+from .ple_disk import Qwen4ExpPLEDiskEmbedding, ple_staged_enabled
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
+
+    # Class default so a state built without __init__ (upstream's unit tests,
+    # which stub only disk_offload_modules) stages nothing.
+    staged_ple: tuple[Qwen4ExpNGramEmbedding, ...] = ()
 
     def __init__(
         self,
@@ -67,6 +73,18 @@ class Qwen4ExpModelState(MambaHybridModelState):
             if isinstance(module, Qwen4ExpNGramEmbedding)
             and isinstance(module.ngram_embedding, Qwen4ExpPLEDiskOffloadEmbedding)
         ]
+        # Disk-backed PLE tables (QWEN4EXP_PLE_STAGED=1) get their rows gathered
+        # here, on the host before the forward or FULL graph replay, into a
+        # fixed buffer the graph reads (see ple_disk.py).
+        staged_ple: list[Qwen4ExpNGramEmbedding] = []
+        if ple_staged_enabled():
+            for module in model.modules():
+                if isinstance(module, Qwen4ExpNGramEmbedding) and isinstance(
+                    module.ngram_embedding, Qwen4ExpPLEDiskEmbedding
+                ):
+                    module.init_disk_staging(self.max_num_tokens, self.device)
+                    staged_ple.append(module)
+        self.staged_ple = tuple(staged_ple)
 
     def _prepare_ngram_context(
         self,
@@ -122,6 +140,25 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        if self.staged_ple:
+            num_reqs = input_batch.num_reqs
+            # Dummy/profile batches have no prompt: stage zeros, skip the table.
+            is_real = (
+                num_reqs > 0 and int(input_batch.prefill_len_np[:num_reqs].max()) > 0
+            )
+            num_tokens = input_batch.num_tokens if is_real else 0
+            padded_tokens = input_batch.num_tokens_after_padding
+            # The host read needs this step's ids, which the previous step
+            # sampled on the GPU, so the id copy syncs by design.
+            with gpu_sync_allowed():
+                for module in self.staged_ple:
+                    module.stage_disk_rows(
+                        input_batch.input_ids[:padded_tokens],
+                        query_start_loc,
+                        ngram_context,
+                        num_tokens,
+                        padded_tokens,
+                    )
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -153,6 +190,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        for module in self.staged_ple:
+            # Capture time: no host-side gather may be queued here.
+            module.stage_disk_zero(num_tokens)
         return model_inputs
 
 

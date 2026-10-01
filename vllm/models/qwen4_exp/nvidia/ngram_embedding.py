@@ -566,6 +566,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
-        if disk_embedding is not None:
-            disk_embedding.verify_loaded()
+        # No verify_loaded() here: AutoWeightsLoader groups consecutive names,
+        # so this runs once per checkpoint file that holds a slice of this
+        # module (the stock NVIDIA checkpoint keeps the hash buffers in
+        # model-00001 and the scale in model-fp8-mtp-ple). The scale is checked
+        # once after the whole stream, in the model's process_weights_after_loading.
         return loaded

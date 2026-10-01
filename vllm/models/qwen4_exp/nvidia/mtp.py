@@ -370,11 +370,21 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
 
 def _draft_vocab_size() -> int:
-    """QWEN4EXP_DRAFT_VOCAB: draft only token ids [0, K); 0 or unset = off."""
+    """QWEN4EXP_DRAFT_VOCAB: draft only token ids [0, K); 0 or unset = off.
+
+    A non-integer or negative value raises instead of silently turning the feature off,
+    because a typo would otherwise cost the acceptance gain with no signal.
+    """
+    raw = os.environ.get("QWEN4EXP_DRAFT_VOCAB", "0")
     try:
-        return int(os.environ.get("QWEN4EXP_DRAFT_VOCAB", "0"))
+        value = int(raw)
     except ValueError:
-        return 0
+        raise ValueError(
+            f"QWEN4EXP_DRAFT_VOCAB must be a non-negative integer, got {raw!r}"
+        ) from None
+    if value < 0:
+        raise ValueError(f"QWEN4EXP_DRAFT_VOCAB must be non-negative, got {value}")
+    return value
 
 
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
@@ -404,6 +414,13 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
 
         super().__init__()
         self.config = config
+        # Validated once at init rather than on the first draft.
+        draft_vocab = _draft_vocab_size()
+        if draft_vocab > int(config.vocab_size):
+            raise ValueError(
+                f"QWEN4EXP_DRAFT_VOCAB={draft_vocab} exceeds the vocabulary "
+                f"size {config.vocab_size}"
+            )
         self.model = Qwen4ExpMultiTokenPredictor(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),

@@ -10,6 +10,7 @@ from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -78,6 +79,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+from .ple_disk import Qwen4ExpPLEDiskEmbedding
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
 
@@ -127,6 +129,31 @@ def _remap_qsa_cache_scale_name(
         if mapped_suffix is not None:
             return f"{name[: marker_start + len(marker)]}{mapped_suffix}"
     return name
+
+
+logger = init_logger(__name__)
+
+
+def verify_ple_disk_tables_loaded(model: nn.Module) -> None:
+    """Fail closed if a disk-backed FP8 PLE table never got its global scale.
+
+    Runs after the full weight stream because a table's tensors can span
+    several checkpoint files, so its load_weights is called once per file.
+    """
+    verified = 0
+    for module in model.modules():
+        if isinstance(module, Qwen4ExpPLEDiskEmbedding):
+            module.verify_loaded()
+            verified += 1
+            # Logged so the boot log shows the hook ran; a skipped hook would
+            # otherwise look the same as a passing one.
+            logger.info(
+                "PLE disk: post-load verify OK (fp8=%s, weight_scale=%s)",
+                module.is_fp8,
+                float(module.weight_scale) if module.is_fp8 else "n/a",
+            )
+    if verified == 0:
+        logger.info("PLE disk: post-load verify found no disk-backed PLE table")
 
 
 _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
@@ -857,6 +884,9 @@ class Qwen4ExpForCausalLM(
         )
         return loader.load_weights(weights, mapper=mapper)
 
+    def process_weights_after_loading(self) -> None:
+        verify_ple_disk_tables_loaded(self)
+
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self) -> Qwen4ExpConfig:
@@ -1051,6 +1081,9 @@ class Qwen4ExpForConditionalGeneration(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=mapper)
+
+    def process_weights_after_loading(self) -> None:
+        verify_ple_disk_tables_loaded(self)
 
     @classmethod
     def get_mamba_state_dtype_from_config(

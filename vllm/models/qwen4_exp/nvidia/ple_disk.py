@@ -55,14 +55,22 @@ _TORCH_DTYPE = {
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
+def _env_flag(name: str) -> bool:
+    """A strict 0/1 switch: a typo must not silently select the resident table path."""
+    raw = os.environ.get(name, "0")
+    if raw not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
+
 def ple_disk_enabled() -> bool:
     """Serve the PLE table from the checkpoint files instead of memory."""
-    return os.environ.get("QWEN4EXP_PLE_MMAP", "0") == "1"
+    return _env_flag("QWEN4EXP_PLE_MMAP")
 
 
 def ple_staged_enabled() -> bool:
     """Gather PLE rows in the model state, before the forward/graph replay."""
-    return ple_disk_enabled() and os.environ.get("QWEN4EXP_PLE_STAGED", "0") == "1"
+    return ple_disk_enabled() and _env_flag("QWEN4EXP_PLE_STAGED")
 
 
 def _read_header(path: str) -> tuple[dict, int]:
@@ -361,6 +369,9 @@ class Qwen4ExpPLEDiskEmbedding(nn.Module):
                 f"quantization config selects {expected_dtype} for {prefix}"
             )
         self.is_fp8 = self.table.dtype in _FP8_DTYPES
+        # Set by verify_loaded(); dequantize() refuses to run on an FP8 table until
+        # then, so a skipped post-load hook fails loudly instead of using a NaN scale.
+        self._verified = False
         self.weight = torch.empty((0, self.embedding_dim), dtype=self.table.dtype)
         # NaN until the checkpoint's global scale is loaded (FP8 tables only).
         self.register_buffer(
@@ -394,6 +405,14 @@ class Qwen4ExpPLEDiskEmbedding(nn.Module):
                 "FP8 PLE checkpoint global scale must be finite and positive, "
                 f"got {scale}"
             )
+        # The streamed scale must be the one in the checkpoint file the rows come from.
+        on_disk = float(self.table.read_scale())
+        if on_disk != scale:
+            raise ValueError(
+                f"FP8 PLE global scale {scale} differs from the checkpoint "
+                f"file's {on_disk}"
+            )
+        self._verified = True
 
     def start_prefetch(
         self,
@@ -410,6 +429,11 @@ class Qwen4ExpPLEDiskEmbedding(nn.Module):
     ) -> torch.Tensor:
         if not self.is_fp8:
             return embeddings.to(output_dtype)
+        if not self._verified:
+            raise RuntimeError(
+                "PLE disk: the FP8 scale was never verified; "
+                "process_weights_after_loading did not run"
+            )
         scale = self.weight_scale
         if scale.device != embeddings.device:
             raise RuntimeError("PLE disk: FP8 scale must be on the output device")

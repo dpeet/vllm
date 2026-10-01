@@ -519,6 +519,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             else None
         )
 
+        if disk_embedding is not None and getattr(disk_embedding, "_verified", False):
+            # The disk table binds its checkpoint files and scale when the engine loads;
+            # an in-place reload would serve new weights against the old PLE rows.
+            raise RuntimeError(
+                "PLE disk: in-place weight reload is not supported with a "
+                "disk-backed PLE table; restart the engine with the new checkpoint"
+            )
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":

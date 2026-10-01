@@ -519,7 +519,9 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         The draft lm_head matmul is memory-bound, so scoring only the lowest
         ids (BPE merge order as a frequency proxy, after FR-Spec) cuts its
         weight read by 1 - K/V. The target still verifies every draft over the
-        full vocabulary, so outputs are unchanged; only acceptance can move.
+        full vocabulary, so greedy outputs are unchanged and sampled outputs keep
+        the target's distribution (a different draft changes which tokens are
+        proposed, so a seeded sampled sequence may differ); only acceptance can move.
         Each TP rank scores the rows of its vocab slice below the limit and
         the ranks sum (each column has one owner); the result is widened to
         the full vocabulary so the speculator's argmax yields global ids.

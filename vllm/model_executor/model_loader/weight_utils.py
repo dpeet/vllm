@@ -626,14 +626,7 @@ def filter_safetensors_files_by_weight_names(
         indexed_files.add(path)
         if keep_weight(weight_name):
             needed_files.add(path)
-    kept = [f for f in hf_weights_files if f in needed_files or f not in indexed_files]
-    if len(kept) < len(hf_weights_files):
-        logger.info(
-            "Weight-name filter: reading %d of %d checkpoint files",
-            len(kept),
-            len(hf_weights_files),
-        )
-    return kept
+    return [f for f in hf_weights_files if f in needed_files or f not in indexed_files]
 
 
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:

@@ -138,12 +138,19 @@ assert remap_mtp("lm_head.weight") and remap_mtp(
 
 disk = FakeModel(ple_on_disk=True)
 main_disk = report("target, PLE on disk", lambda n: main_kept(disk, n))
+assert all(os.path.basename(f) != "model-fp8-mtp-ple.safetensors" for f in main_disk)
 rejected = [n for n in weight_map if not main_kept(disk, n)]
-assert all(n.startswith("mtp.") or ".ngram_embedding.shard_" in n for n in rejected)
+assert all(
+    n.startswith("mtp.")
+    or ".ngram_embedding.shard_" in n
+    or n.endswith(".ngram_embedding.weight_scale")
+    for n in rejected
+)
 assert sum(".ngram_embedding.shard_" in n for n in rejected) == 128
 scale = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale"
-assert main_kept(disk, scale)
+assert not main_kept(disk, scale)
 resident = FakeModel(ple_on_disk=False)
+assert main_kept(resident, scale)
 assert all(main_kept(resident, n) for n in weight_map if not n.startswith("mtp."))
 
 # The draft resolves to the lazy safetensors iterator under a whole-file target

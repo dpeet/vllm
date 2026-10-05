@@ -143,14 +143,24 @@ def verify_ple_disk_tables_loaded(model: nn.Module) -> None:
     verified = 0
     for module in model.modules():
         if isinstance(module, Qwen4ExpPLEDiskEmbedding):
+            scale_source = "n/a"
+            if module.is_fp8:
+                if torch.isnan(module.weight_scale):
+                    scale_source = "table"
+                    # The loader dropped the scale to skip the file; read it directly.
+                    module.load_scale(module.table.read_scale())
+                else:
+                    scale_source = "stream"
             module.verify_loaded()
             verified += 1
             # Logged so the boot log shows the hook ran; a skipped hook would
             # otherwise look the same as a passing one.
             logger.info(
-                "PLE disk: post-load verify OK (fp8=%s, weight_scale=%s)",
+                "PLE disk: post-load verify OK "
+                "(fp8=%s, weight_scale=%s, scale_source=%s)",
                 module.is_fp8,
                 float(module.weight_scale) if module.is_fp8 else "n/a",
+                scale_source,
             )
     if verified == 0:
         logger.info("PLE disk: post-load verify found no disk-backed PLE table")
@@ -160,13 +170,15 @@ def qwen4_exp_main_weight_kept(model: nn.Module, name: str) -> bool:
     """Checkpoint names the target model consumes (read by DefaultModelLoader).
 
     Rejects only names load_weights would drop anyway: the MTP head (the "mtp."
-    mapper entry) and, when the PLE table is served from disk, its row shards,
-    which Qwen4ExpNGramEmbedding.load_weights skips. The FP8 weight_scale is kept,
-    so verify_ple_disk_tables_loaded still sees it.
+    mapper entry) and, when the PLE table is served from disk, its row shards
+    and the FP8 weight_scale. The scale is no longer streamed under a disk table;
+    it is read from the table's own checkpoint header at post-load.
     """
     if name.startswith("mtp."):
         return False
-    if ".ngram_embedding.shard_" in name and name.endswith(".weight"):
+    if (
+        ".ngram_embedding.shard_" in name and name.endswith(".weight")
+    ) or name.endswith(".ngram_embedding.weight_scale"):
         # ple_disk_enabled() switches every PLE table, so one disk table means all.
         return not any(isinstance(m, Qwen4ExpPLEDiskEmbedding) for m in model.modules())
     return True

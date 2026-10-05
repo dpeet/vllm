@@ -1034,6 +1034,14 @@ def safetensors_weights_iterator(
                     if skip(name):
                         continue
                     param = f.get_tensor(name)
+                    if weight_name_filter is not None:
+                        # A filtered load reads a few GiB of a large checkpoint
+                        # (the Qwen4Exp MTP draft: 4.88 GiB), and on GB10 an H2D
+                        # copy straight from an mmap view faults page by page
+                        # inside the driver copy (~150 MB/s, 34 s for the draft).
+                        # Cloning first faults the pages on the CPU (~2.2 GiB/s,
+                        # vllm-project/vllm#58726), one transient tensor at a time.
+                        param = param.clone()
                     yield name, param
 
 

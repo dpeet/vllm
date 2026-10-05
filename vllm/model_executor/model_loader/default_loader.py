@@ -84,7 +84,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         is_unused_weight: Callable[[str], bool] | None = None
         """If defined, safetensors shards holding only weights whose checkpoint
-        name (before *prefix*) it accepts are not read."""
+        name (before *prefix*) it accepts are not read, and the lazy and torchao
+        safetensors strategies skip accepted names before reading them. Other
+        iterators still yield every name in the kept files."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -354,6 +356,7 @@ class DefaultModelLoader(BaseModelLoader):
                         shuffle_safetensors_files=(
                             self.load_config.shuffle_safetensors_files
                         ),
+                        is_unused_weight=source.is_unused_weight,
                     )
         else:
             if extra_config.get("enable_multithread_load"):

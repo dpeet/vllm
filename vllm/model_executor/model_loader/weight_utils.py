@@ -636,6 +636,40 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
+def filter_safetensors_files_by_weight_names(
+    hf_weights_files: list[str],
+    hf_folder: str,
+    keep_weight: Callable[[str], bool],
+    index_file: str = SAFE_WEIGHTS_INDEX_NAME,
+) -> list[str]:
+    """Drop shard files that hold no tensor the model will keep.
+
+    Uses the safetensors index's weight_map, so no shard header is read. A file
+    the index does not mention is kept (its contents are unknown), and with no
+    index the list comes back unchanged, so the load reads what it reads today.
+    """
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+    indexed_files: set[str] = set()
+    needed_files: set[str] = set()
+    for weight_name, file_name in weight_map.items():
+        path = os.path.join(hf_folder, file_name)
+        indexed_files.add(path)
+        if keep_weight(weight_name):
+            needed_files.add(path)
+    kept = [f for f in hf_weights_files if f in needed_files or f not in indexed_files]
+    if len(kept) < len(hf_weights_files):
+        logger.info(
+            "Weight-name filter: reading %d of %d checkpoint files",
+            len(kept),
+            len(hf_weights_files),
+        )
+    return kept
+
+
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
     """
     Exclude files that are not needed for inference.
@@ -871,13 +905,23 @@ def safetensors_weights_iterator(
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+    weight_name_filter: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
     reduces storage I/O for MoE models under EP.
+
+    When *weight_name_filter* is provided, names it rejects are skipped before
+    get_tensor in the lazy and torchao strategies (eager reads whole files).
     """
+
+    def skip(name: str) -> bool:
+        if weight_name_filter is not None and not weight_name_filter(name):
+            return True
+        return should_skip_weight(name, local_expert_ids)
+
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
@@ -959,7 +1003,7 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
+                if not skip(name):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -976,7 +1020,7 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if skip(name):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -994,7 +1038,7 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if skip(name):
                         continue
                     param = f.get_tensor(name)
                     yield name, param

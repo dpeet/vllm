@@ -530,6 +530,15 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             full.mul_(scale)
         return full
 
+    def weight_name_filter(self, name: str) -> bool:
+        """Checkpoint names this draft head consumes (read by DefaultModelLoader).
+
+        The same predicate load_weights uses to drop names, so the loader can skip
+        the shard files (and, on the lazy path, the tensors) that hold only main-model
+        weights instead of materializing all of them first.
+        """
+        return _remap_mtp_weight_name(name) is not None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
             for name, weight in weights:

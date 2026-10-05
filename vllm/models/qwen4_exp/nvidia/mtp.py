@@ -557,6 +557,12 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
             full.mul_(scale)
         return full
 
+    # The draft keeps 4.88 GiB of the 55 GiB in its three files (most of it in the
+    # 50 GiB model-fp8-mtp-ple.safetensors), so it loads through the lazy mmap
+    # iterator even when the target uses instanttensor/fastsafetensors, which read
+    # whole files (~26 s and the boot's MemAvailable low under instanttensor).
+    load_filtered_weights_lazily = True
+
     def is_unused_checkpoint_weight(self, name: str) -> bool:
         """Checkpoint names this draft head drops (read by DefaultModelLoader).
 

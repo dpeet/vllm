@@ -38,6 +38,14 @@ logger = init_logger(__name__)
 PLAN_SCHEMA_VERSION = 1
 
 
+def _get_device_total_memory() -> int:
+    try:
+        return current_platform.get_device_total_memory()
+    except Exception:
+        # Fallback because NVML raises NotSupported on GB10/unified memory.
+        return torch.cuda.get_device_properties(0).total_memory
+
+
 def compute_plan_fingerprint(
     vllm_config: VllmConfig, rank: int, world_size: int
 ) -> str:
@@ -63,7 +71,7 @@ def compute_plan_fingerprint(
         "vllm": vllm_version,
         "vllm_config": vllm_config.compute_hash(),
         "device_name": current_platform.get_device_name(),
-        "device_total_memory": current_platform.get_device_total_memory(),
+        "device_total_memory": _get_device_total_memory(),
         "device_capability": str(capability) if capability else "",
         "torch": torch.__version__,
         "cuda": torch.version.cuda or "",

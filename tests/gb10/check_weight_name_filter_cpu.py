@@ -3,7 +3,9 @@
 
 Extracts the committed functions with ast (no torch/vLLM import), runs them against
 the checkpoint's model.safetensors.index.json and shard headers, and asserts that
-every name the MTP draft head or the target model consumes stays in the files read.
+every name the MTP draft head or the target model consumes stays in the files read,
+and that the draft resolves to the lazy safetensors iterator when the target's load
+format is a whole-file loader (instanttensor, fastsafetensors).
 
 Usage: uv run --no-project python tests/gb10/check_weight_name_filter_cpu.py [ckpt_dir]
 """
@@ -143,6 +145,72 @@ scale = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_
 assert main_kept(disk, scale)
 resident = FakeModel(ple_on_disk=False)
 assert all(main_kept(resident, n) for n in weight_map if not n.startswith("mtp."))
+
+# The draft resolves to the lazy safetensors iterator under a whole-file target
+# load format; the target (no load_filtered_weights_lazily) keeps its format.
+loader_py = REPO / "vllm/model_executor/model_loader/default_loader.py"
+loader_tree = ast.parse(loader_py.read_text())
+whole_file = next(
+    n
+    for n in loader_tree.body
+    if isinstance(n, ast.Assign) and n.targets[0].id == "WHOLE_FILE_LOAD_FORMATS"
+)
+ns["WHOLE_FILE_LOAD_FORMATS"] = ast.literal_eval(whole_file.value)
+load_functions(loader_py, {"resolve_filtered_load_format"}, ns)
+resolve = ns["resolve_filtered_load_format"]
+mtp_filter = lambda n: remap_mtp(n) is not None  # noqa: E731
+for fmt in ("instanttensor", "fastsafetensors"):
+    assert resolve(fmt, mtp_filter, True) == "safetensors", fmt
+    assert resolve(fmt, mtp_filter, False) == fmt, fmt  # target with its filter
+    assert resolve(fmt, None, True) == fmt, fmt
+for fmt in ("auto", "safetensors", "npcache", "pt"):
+    assert resolve(fmt, mtp_filter, True) == fmt, fmt
+
+
+def class_flag(path: Path, cls: str, flag: str = "load_filtered_weights_lazily"):
+    tree = ast.parse(path.read_text())
+    body = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
+    for n in body.body:
+        if isinstance(n, ast.Assign) and n.targets[0].id == flag:
+            return ast.literal_eval(n.value)
+    return None
+
+
+assert class_flag(REPO / "vllm/models/qwen4_exp/nvidia/mtp.py", "Qwen4ExpMTP") is True
+for cls in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"):
+    assert class_flag(REPO / "vllm/models/qwen4_exp/nvidia/model.py", cls) is None
+
+# _get_weights_iterator must dispatch on the resolved format, not the LoadConfig's,
+# and give the lazy branch the "lazy" strategy and the filter.
+loader_cls = next(
+    n
+    for n in loader_tree.body
+    if isinstance(n, ast.ClassDef) and n.name == "DefaultModelLoader"
+)
+get_iter = next(
+    n
+    for n in loader_cls.body
+    if isinstance(n, ast.FunctionDef) and n.name == "_get_weights_iterator"
+)
+format_names = ("npcache", *ns["WHOLE_FILE_LOAD_FORMATS"])
+for node in ast.walk(get_iter):
+    if (
+        isinstance(node, ast.Compare)
+        and isinstance(node.comparators[0], ast.Constant)
+        and node.comparators[0].value in format_names
+    ):
+        assert isinstance(node.left, ast.Name), ast.unparse(node)
+        assert node.left.id == "load_format", ast.unparse(node)
+lazy_branch = next(
+    n
+    for n in ast.walk(get_iter)
+    if isinstance(n, ast.If) and ast.unparse(n.test) == "lazy_filtered"
+)
+lazy_call = lazy_branch.body[0].value
+assert ast.unparse(lazy_call.func) == "safetensors_weights_iterator"
+assert ast.literal_eval(lazy_call.args[2]) == "lazy"
+assert {k.arg for k in lazy_call.keywords} >= {"weight_name_filter"}
+print("draft load format: instanttensor/fastsafetensors -> safetensors (lazy) OK")
 
 with tempfile.TemporaryDirectory() as d:  # no index: unchanged
     files = [os.path.join(d, "a.safetensors"), os.path.join(d, "b.safetensors")]

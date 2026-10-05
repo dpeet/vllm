@@ -155,6 +155,22 @@ def verify_ple_disk_tables_loaded(model: nn.Module) -> None:
         logger.info("PLE disk: post-load verify found no disk-backed PLE table")
 
 
+def qwen4_exp_main_weight_kept(model: nn.Module, name: str) -> bool:
+    """Checkpoint names the target model consumes (read by DefaultModelLoader).
+
+    Rejects only names load_weights would drop anyway: the MTP head (the "mtp."
+    mapper entry) and, when the PLE table is served from disk, its row shards,
+    which Qwen4ExpNGramEmbedding.load_weights skips. The FP8 weight_scale is kept,
+    so verify_ple_disk_tables_loaded still sees it.
+    """
+    if name.startswith("mtp."):
+        return False
+    if ".ngram_embedding.shard_" in name and name.endswith(".weight"):
+        # ple_disk_enabled() switches every PLE table, so one disk table means all.
+        return not any(isinstance(m, Qwen4ExpPLEDiskEmbedding) for m in model.modules())
+    return True
+
+
 _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     ".bias",
     "_bias",
@@ -899,6 +915,9 @@ class Qwen4ExpForCausalLM(
         )
         return loader.load_weights(weights, mapper=mapper)
 
+    def weight_name_filter(self, name: str) -> bool:
+        return qwen4_exp_main_weight_kept(self, name)
+
     def process_weights_after_loading(self) -> None:
         verify_ple_disk_tables_loaded(self)
 
@@ -1096,6 +1115,9 @@ class Qwen4ExpForConditionalGeneration(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=mapper)
+
+    def weight_name_filter(self, name: str) -> bool:
+        return qwen4_exp_main_weight_kept(self, name)
 
     def process_weights_after_loading(self) -> None:
         verify_ple_disk_tables_loaded(self)

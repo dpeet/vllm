@@ -40,6 +40,32 @@ from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
 
+# Loaders that read every byte of each file they are given, so a name filter
+# cannot save I/O inside a kept file the way the lazy mmap iterator does.
+WHOLE_FILE_LOAD_FORMATS = ("fastsafetensors", "instanttensor")
+
+
+def resolve_filtered_load_format(
+    load_format: str,
+    weight_name_filter: Callable[[str], bool] | None,
+    load_filtered_weights_lazily: bool,
+) -> str:
+    """The load format one weight source actually uses.
+
+    A model that sets load_filtered_weights_lazily (the Qwen4Exp MTP draft head)
+    keeps a small slice of a large shared shard; a whole-file loader would read
+    the entire shard anyway, so that source drops to the lazy safetensors
+    iterator, which skips rejected names before reading them. Every other source,
+    including the target model loaded with the same LoadConfig, is unchanged.
+    """
+    if (
+        weight_name_filter is not None
+        and load_filtered_weights_lazily
+        and load_format in WHOLE_FILE_LOAD_FORMATS
+    ):
+        return "safetensors"
+    return load_format
+
 
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
@@ -74,6 +100,11 @@ class DefaultModelLoader(BaseModelLoader):
         holding none of the kept names are dropped via the safetensors index,
         and the lazy safetensors iterator skips rejected names before reading
         them. Other iterators still yield every name in the kept files."""
+
+        load_filtered_weights_lazily: bool = False
+        """If True and weight_name_filter is set, a whole-file load format
+        (fastsafetensors, instanttensor) is swapped for the lazy safetensors
+        iterator for this source only; see resolve_filtered_load_format."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -260,11 +291,31 @@ class DefaultModelLoader(BaseModelLoader):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        load_format = resolve_filtered_load_format(
+            self.load_config.load_format,
+            source.weight_name_filter,
+            source.load_filtered_weights_lazily,
+        )
+        lazy_filtered = load_format != self.load_config.load_format
         if source.weight_name_filter is not None and use_safetensors:
+            num_files = len(hf_weights_files)
             hf_weights_files = filter_safetensors_files_by_weight_names(
                 hf_weights_files, hf_folder, source.weight_name_filter
             )
-        if self.load_config.load_format == "npcache":
+            logger.info(
+                "Weight-name filter: load format %s%s, reading %d of %d "
+                "checkpoint files: %s",
+                load_format,
+                (
+                    f" (lazy mmap, overriding {self.load_config.load_format})"
+                    if lazy_filtered
+                    else ""
+                ),
+                len(hf_weights_files),
+                num_files,
+                ", ".join(os.path.basename(f) for f in hf_weights_files),
+            )
+        if load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
             weights_iterator = np_cache_weights_iterator(
@@ -275,12 +326,22 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
-            if self.load_config.load_format == "fastsafetensors":
+            if lazy_filtered:
+                # Strategy pinned to "lazy": eager and prefetch would read whole
+                # files and undo the point of overriding the whole-file loader.
+                weights_iterator = safetensors_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    "lazy",
+                    local_expert_ids=self.local_expert_ids,
+                    weight_name_filter=source.weight_name_filter,
+                )
+            elif load_format == "fastsafetensors":
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                 )
-            elif self.load_config.load_format == "instanttensor":
+            elif load_format == "instanttensor":
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
@@ -342,6 +403,9 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
             weight_name_filter=getattr(model, "weight_name_filter", None),
+            load_filtered_weights_lazily=getattr(
+                model, "load_filtered_weights_lazily", False
+            ),
         )
         yield from self._get_weights_iterator(primary_weights)
 

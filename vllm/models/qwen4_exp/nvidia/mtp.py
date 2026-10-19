@@ -406,6 +406,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=mapper)
 
 
+# torch counts FP8 as floating point, so list the unquantized dtypes explicitly.
+_DRAFT_VOCAB_HEAD_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
 def _draft_vocab_size() -> int:
     """QWEN4EXP_DRAFT_VOCAB: draft only token ids [0, K); 0 or unset = off.
 
@@ -534,6 +538,15 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
             low, high = max(start, 0), min(end, vocab_limit)
             head_weight = head.weight
             assert isinstance(head_weight, torch.Tensor)
+            if head_weight.dtype not in _DRAFT_VOCAB_HEAD_DTYPES:
+                # A quantized head (speculative_config.draft_lm_head_quantization,
+                # #59973) stores packed NVFP4 bytes or FP8 values with separate
+                # scales, so slicing rows and F.linear would score garbage.
+                raise ValueError(
+                    f"QWEN4EXP_DRAFT_VOCAB needs an unquantized draft lm_head, got "
+                    f"weight dtype {head_weight.dtype}; unset QWEN4EXP_DRAFT_VOCAB "
+                    "or draft_lm_head_quantization"
+                )
             weight = (
                 head_weight[low - start : high - start].contiguous()
                 if high > low

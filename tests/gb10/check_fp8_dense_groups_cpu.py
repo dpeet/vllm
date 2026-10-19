@@ -3,20 +3,24 @@
 
 Needs an importable vLLM carrying this fork (run it in the image under test, or with
 the fork's Python sources on PYTHONPATH over a vLLM install); reads only the
-checkpoint's index and hf_quant_config.json, never a weight. Asserts:
+checkpoint's index and hf_quant_config.json, never a weight. Runs against a
+MIXED_PRECISION checkpoint (ModelOptMixedPrecisionConfig) or a plain NVFP4 one
+(ModelOptNvFp4Config, whose BF16 linears are its exclude_modules). Asserts:
   1. each group (gdn, attn, shared) matches at least one vLLM linear prefix derived
      from the checkpoint index (packed names applied), in the target, and attn and
      shared also in the MTP drafter;
-  2. the real ModelOptMixedPrecisionConfig built from hf_quant_config.json returns
-     Fp8PerBlockOnlineLinearMethod for those prefixes at both unquantized exits
-     (excluded target layers, MTP layers not in quantized_layers), and the
-     unquantized method for routers, gates, in_proj_ba, the indexer and lm_head;
+  2. the real config built from hf_quant_config.json returns
+     Fp8PerBlockOnlineLinearMethod for every one of those prefixes (counted per
+     group) at its unquantized exits (excluded layers, and for MIXED_PRECISION the
+     MTP layers not in quantized_layers), and never for routers, gates, in_proj_ba,
+     the indexer and lm_head;
   3. mtp gates the drafter, unset/empty changes nothing, lm_head and unknown groups
      raise ValueError, and a fused QSA+indexer linear is refused.
 
 Usage: python3 tests/gb10/check_fp8_dense_groups_cpu.py [ckpt_dir]
 """
 
+import inspect
 import json
 import os
 import re
@@ -34,10 +38,15 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerBlockOnlineLinearMethod,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.model_loader.utils import configure_quant_config
 
 # model.py imports qsa.py, which now imports modelopt's group parser (qsa.py alone
 # hits the pre-existing qsa <-> model import cycle, so import model first).
-from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForConditionalGeneration
+from vllm.models.qwen4_exp.nvidia import model as qwen4_model  # isort: skip
+from vllm.models.qwen4_exp.nvidia import mtp as mtp_mod
+from vllm.models.qwen4_exp.nvidia import qsa as qwen4_qsa
+
+Qwen4ExpForConditionalGeneration = qwen4_model.Qwen4ExpForConditionalGeneration
 
 CKPT = Path(
     sys.argv[1]
@@ -136,16 +145,40 @@ mock.patch.object(
     online_fp8, "get_current_vllm_config", return_value=fake_vllm_config
 ).start()
 
-# The real config: both unquantized exits now return the block-FP8 method.
+# The real config: its unquantized exits now return the block-FP8 method.
 quant_cfg = json.loads((CKPT / "hf_quant_config.json").read_text())
-config = mo.ModelOptMixedPrecisionConfig.from_config(quant_cfg)
+quant_algo = quant_cfg["quantization"]["quant_algo"]
+config_cls = {
+    "MIXED_PRECISION": mo.ModelOptMixedPrecisionConfig,
+    "NVFP4": mo.ModelOptNvFp4Config,
+}[quant_algo]
+config = config_cls.from_config(quant_cfg)
+print(f"quant_algo {quant_algo} -> {config_cls.__name__}")
 config.packed_modules_mapping = dict(packed)
 # As model init does: the config's checkpoint names move to vLLM's.
 mapper = Qwen4ExpForConditionalGeneration.hf_to_vllm_mapper
 config.apply_vllm_mapper(mapper)
 
+# The drafter gets its own config, as _make_draft_vllm_config builds it: the MTP
+# class's mappings, then exclude_modules and quantized_layers renumbered from the
+# checkpoint's mtp.layers.0 to the drafter's mtp.layers.<num_hidden_layers>.
+hf_config = json.loads((CKPT / "config.json").read_text())
+mtp_start = hf_config.get("text_config", hf_config)["num_hidden_layers"]
+draft_config = config_cls.from_config(quant_cfg)
+configure_quant_config(draft_config, mtp_mod.Qwen4ExpMTP)
+draft_config.exclude_modules = mtp_mod._remap_ignored_layers(
+    draft_config.exclude_modules, mtp_start
+)
+if getattr(draft_config, "quantized_layers", None):
+    draft_config.quantized_layers = mtp_mod._remap_quantized_layers(
+        draft_config.quantized_layers, mtp_start
+    )
+
 
 def method_for(prefix: str, layer=None):
+    if prefix.startswith("mtp."):
+        prefix = mtp_mod._remap_ignored_layers([prefix], mtp_start)[0]
+        return draft_config.get_quant_method(layer or FakeLinear(), prefix)
     return config.get_quant_method(layer or FakeLinear(), prefix)
 
 
@@ -155,6 +188,8 @@ def is_loaded(p: str) -> bool:
 
 
 def vllm_prefix(p: str) -> str:
+    if p.startswith("mtp."):  # the drafter's names; method_for renumbers them
+        return p
     (mapped,) = mapper.apply_list([p])
     return mapped
 
@@ -212,12 +247,46 @@ with with_env("gdn,attn,shared"):
     )
 with with_env("attn,shared,mtp"):
     for g, p in sample_drafter.items():
-        excluded = config.is_layer_excluded(p)
+        excluded = draft_config.is_layer_excluded(
+            mtp_mod._remap_ignored_layers([p], mtp_start)[0]
+        )
         m = method_for(p)
         check(
             isinstance(m, Fp8PerBlockOnlineLinearMethod),
             f"mtp+{g}: {p} -> {type(m).__name__} (excluded={excluded})",
         )
+with with_env("gdn,attn,shared,mtp"):
+    # Every matched prefix, not a sample: on plain NVFP4 a prefix the exclude list
+    # missed would get the NVFP4 method and fail to load its BF16 weight.
+    total = 0
+    for g in sorted(matched):
+        loaded = sorted(p for p in matched[g] if p in drafter or is_loaded(p))
+        cast = [
+            p
+            for p in loaded
+            if isinstance(method_for(vllm_prefix(p)), Fp8PerBlockOnlineLinearMethod)
+        ]
+        total += len(cast)
+        t = sum(not p.startswith("mtp.") for p in cast)
+        check(
+            len(cast) == len(loaded),
+            f"all groups+mtp: {g} casts {len(cast)}/{len(loaded)} "
+            f"({t} target, {len(cast) - t} drafter)",
+        )
+    print(f"all groups+mtp: {total} linears cast at get_quant_method")
+if config.get_name() == "modelopt_fp4":
+    # qsa.py builds qkv_proj without a modelopt_fp4 config unless attn is set,
+    # because without the config it never reaches get_quant_method.
+    check(
+        qwen4_model.without_modelopt_fp4(config) is None,
+        "modelopt_fp4: without_modelopt_fp4 drops the config",
+    )
+    qsa_src = inspect.getsource(qwen4_qsa)
+    check(
+        'quant_config\n                if "attn" in qwen38_fp8_dense_groups()\n'
+        "                else model.without_modelopt_fp4(quant_config)" in qsa_src,
+        "modelopt_fp4: QSA qkv_proj keeps the config when attn is set",
+    )
 with with_env("mtp"):
     m = method_for(sample_drafter["attn"])
     check(type(m) is UnquantizedLinearMethod, "mtp alone casts nothing")

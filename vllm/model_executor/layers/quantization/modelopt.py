@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -1559,6 +1561,76 @@ ModelOptMxFp8Config.FusedMoEMethodCls = ModelOptMxFp8FusedMoE
 ModelOptMxFp8Config.KVCacheMethodCls = ModelOptKVCacheMethod
 
 
+# QWEN38_FP8_DENSE: cast chosen BF16 linears that this MIXED_PRECISION checkpoint
+# leaves unquantized to 128x128 block FP8 at load, through vLLM's own
+# Fp8PerBlockOnlineLinearMethod (the scheme FP8_PB_WO checkpoints store). A comma
+# list of groups; unset or empty changes nothing.
+#   gdn      linear_attn.in_proj_qkvz, linear_attn.out_proj
+#   attn     self_attn.qkv_proj, self_attn.o_proj (QSA; not the indexer, which
+#            Qwen4ExpQSAAttention then keeps unfused and BF16)
+#   shared   mlp.shared_expert.gate_up_proj, mlp.shared_expert.down_proj
+#   mtp      allow the groups above inside the MTP drafter too
+# Routers, gates, hyper-connection mixes, in_proj_ba, the PLE layer, the indexer
+# and the embeddings stay BF16 whatever is set. "lm_head" is refused rather than
+# ignored: the Qwen4Exp heads are built without quant_config, so the group cannot
+# reach them here, and an FP8 head belongs with the draft-row head code
+# (QWEN4EXP_DRAFT_VOCAB, draft_lm_head_quantization) instead.
+# Ported from salient-data/qwen38-next-dgx-recipe (Apache-2.0),
+# recipe/patches/0002-fp8-dense-and-draft-vocab.patch.
+_QWEN38_FP8_DENSE_PATTERNS = {
+    "gdn": re.compile(r"\.linear_attn\.(in_proj_qkvz|out_proj)$"),
+    "attn": re.compile(r"\.self_attn\.(qkv_proj|o_proj)$"),
+    "shared": re.compile(r"\.mlp\.shared_expert\.(gate_up_proj|down_proj)$"),
+}
+_QWEN38_FP8_DENSE_GROUPS = frozenset({*_QWEN38_FP8_DENSE_PATTERNS, "mtp"})
+
+
+def qwen38_fp8_dense_groups() -> frozenset[str]:
+    """The QWEN38_FP8_DENSE groups; raises on ``lm_head`` or an unknown name."""
+    raw = os.environ.get("QWEN38_FP8_DENSE", "")
+    groups = frozenset(g.strip() for g in raw.split(",") if g.strip())
+    if "lm_head" in groups:
+        raise ValueError(
+            "QWEN38_FP8_DENSE: the lm_head group is not supported (the Qwen4Exp "
+            "heads are built without quant_config); use gdn, attn, shared, mtp"
+        )
+    unknown = groups - _QWEN38_FP8_DENSE_GROUPS
+    if unknown:
+        raise ValueError(
+            f"QWEN38_FP8_DENSE: unknown group(s) {sorted(unknown)}; "
+            f"valid: {sorted(_QWEN38_FP8_DENSE_GROUPS)}"
+        )
+    return groups
+
+
+def _qwen38_fp8_dense_method(
+    layer: torch.nn.Module, prefix: str
+) -> "QuantizeMethodBase | None":
+    """Block-FP8 online method for a BF16 linear a QWEN38_FP8_DENSE group names."""
+    groups = qwen38_fp8_dense_groups()
+    if not groups:
+        return None
+    if "mtp" in prefix.split(".") and "mtp" not in groups:
+        return None
+    if not isinstance(layer, LinearBase) or not any(
+        _QWEN38_FP8_DENSE_PATTERNS[g].search(prefix)
+        for g in groups
+        if g in _QWEN38_FP8_DENSE_PATTERNS
+    ):
+        return None
+    if type(layer).__name__ == "Qwen4ExpQSAQKVIndexerLinear":
+        raise ValueError(
+            f"QWEN38_FP8_DENSE: {prefix} carries the indexer Q/K rows, which "
+            "stay BF16; the attn group needs the unfused projections"
+        )
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        Fp8PerBlockOnlineLinearMethod,
+    )
+
+    logger.info("QWEN38_FP8_DENSE: %s -> block FP8 (online)", prefix)
+    return Fp8PerBlockOnlineLinearMethod()
+
+
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     """Config class for ModelOpt MIXED_PRECISION.
 
@@ -1842,7 +1914,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         # Excluded layers
         if self.is_layer_excluded(prefix):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
+                return (
+                    _qwen38_fp8_dense_method(layer, prefix) or UnquantizedLinearMethod()
+                )
             return None
 
         quant_algo = self._resolve_quant_algo(prefix)
@@ -1870,7 +1944,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             # the MoE method that shares the sub-config.
             if quant_algo is None or quant_algo not in LINEAR_ALGOS:
                 # Layer not in quantized_layers — leave unquantized
-                return UnquantizedLinearMethod()
+                return (
+                    _qwen38_fp8_dense_method(layer, prefix) or UnquantizedLinearMethod()
+                )
             _, subcfg_attr = LINEAR_ALGOS[quant_algo]
             return build_linear_method(getattr(self, subcfg_attr), quant_algo, prefix)
 

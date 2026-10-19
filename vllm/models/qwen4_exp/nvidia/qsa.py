@@ -417,7 +417,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=model.without_modelopt_fp4(quant_config),
+            # A plain-NVFP4 checkpoint keeps QKV BF16, so it is built without the
+            # config; the attn group needs the config to reach the excluded-layer
+            # exit of get_quant_method, which casts it.
+            quant_config=(
+                quant_config
+                if "attn" in qwen38_fp8_dense_groups()
+                else model.without_modelopt_fp4(quant_config)
+            ),
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(

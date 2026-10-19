@@ -236,7 +236,9 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         # handle exclusion
         if self.is_layer_excluded(prefix):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
+                return (
+                    _qwen38_fp8_dense_method(layer, prefix) or UnquantizedLinearMethod()
+                )
             return None
 
         # TODO: This special hard coded logic is not needed for quantized checkpoints
@@ -1561,8 +1563,9 @@ ModelOptMxFp8Config.FusedMoEMethodCls = ModelOptMxFp8FusedMoE
 ModelOptMxFp8Config.KVCacheMethodCls = ModelOptKVCacheMethod
 
 
-# QWEN38_FP8_DENSE: cast chosen BF16 linears that this MIXED_PRECISION checkpoint
-# leaves unquantized to 128x128 block FP8 at load, through vLLM's own
+# QWEN38_FP8_DENSE: cast chosen BF16 linears that a Qwen4Exp ModelOpt checkpoint
+# leaves unquantized (MIXED_PRECISION's excluded and unlisted layers, or plain
+# NVFP4's exclude_modules) to 128x128 block FP8 at load, through vLLM's own
 # Fp8PerBlockOnlineLinearMethod (the scheme FP8_PB_WO checkpoints store). A comma
 # list of groups; unset or empty changes nothing.
 #   gdn      linear_attn.in_proj_qkvz, linear_attn.out_proj

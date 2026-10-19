@@ -27,6 +27,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import qwen38_fp8_dense_groups
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.model_executor.models.qwen3_vl import mrope_positions_factor
@@ -496,7 +497,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.use_fused_qsa_prepare = (
             self.use_fused_qk_norm_rope_gate and self.indexer.use_fused_pre_indexer
         )
-        self.fuse_indexer_projection = vllm_config.lora_config is None
+        # QWEN38_FP8_DENSE's attn group casts self_attn.qkv_proj by prefix; the
+        # fused linear keeps that prefix but also carries the indexer Q/K rows,
+        # which stay BF16, so the cast keeps the two projections separate.
+        self.fuse_indexer_projection = (
+            vllm_config.lora_config is None and "attn" not in qwen38_fp8_dense_groups()
+        )
         if self.fuse_indexer_projection:
             self.index_qk_size = self.indexer.index_qk_proj.output_size
             self.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(

@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -28,6 +29,9 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+# GB10 APC diagnostic: upstream logs no eagle-group layout, which the APC gate reads.
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -135,6 +139,27 @@ class KVCacheCoordinator(ABC):
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
         # Lookahead hashes clear ``use_eagle``: groups stay flagged, none drops.
         self.drop_eagle_group_ids = self.eagle_group_ids if use_eagle else set()
+        logger.info(
+            "APC diag: use_eagle=%s eagle_group_ids=%s drop_eagle_group_ids=%s "
+            "num_hash_lookahead_tokens=%d scheduler_block_size=%d "
+            "hash_block_size=%d groups=%s",
+            use_eagle,
+            sorted(self.eagle_group_ids),
+            sorted(self.drop_eagle_group_ids),
+            num_hash_lookahead_tokens,
+            scheduler_block_size,
+            hash_block_size,
+            [
+                (
+                    i,
+                    type(g.kv_cache_spec).__name__,
+                    g.kv_cache_spec.block_size,
+                    getattr(g.kv_cache_spec, "prefix_cacheable", None),
+                    g.is_eagle_group,
+                )
+                for i, g in enumerate(kv_cache_config.kv_cache_groups)
+            ],
+        )
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
         # token past the chunk boundary is combined with the final hidden state

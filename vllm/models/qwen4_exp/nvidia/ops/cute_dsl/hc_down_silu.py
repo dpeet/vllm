@@ -13,6 +13,7 @@ both with PDL. The model uses its Linear module above M=48.
 """
 
 import logging
+import sys
 from collections.abc import Iterable
 from functools import lru_cache, partial
 from typing import Any, Literal
@@ -60,6 +61,34 @@ class HcDownSiluGemm:
         if compile_key in self._compiled:
             return
 
+        from vllm.model_executor.warmup.cutedsl_aot_cache import cached_cute_compile
+
+        if compile_key[0] == "mma":
+            from . import _hc_down_silu_mma as kernel_module
+
+            options = "--enable-tvm-ffi"
+        else:
+            from . import _hc_down_silu_fma as kernel_module  # type: ignore[no-redef]
+
+            options = "--enable-tvm-ffi --ptxas-options -maxrregcount=64"
+        # rank, hc and the prefetch flag are baked into the kernel while N and K
+        # are sym_int (the MMA key doesn't even carry K), so all of them key it.
+        self._compiled[compile_key] = cached_cute_compile(
+            "qwen4-exp-hc-down-silu",
+            (
+                self.rank,
+                self.hc,
+                self.k,
+                self._prefetch_pdl_weights,
+                compile_key,
+                options,
+            ),
+            partial(self._compile_uncached, compile_key, options),
+            (sys.modules[__name__], kernel_module),
+        )
+        logger.debug("Compiled hc_down_silu: %s", compile_key)
+
+    def _compile_uncached(self, compile_key: CompileKey, options: str) -> Any:
         import cutlass.cute as cute
         from cutlass import BFloat16
         from quack.compile_utils import make_fake_tensor
@@ -80,7 +109,6 @@ class HcDownSiluGemm:
                 hc=self.hc,
             )
             extra_args = ()
-            options = "--enable-tvm-ffi"
         else:
             from ._hc_down_silu_fma import HcDownSiluFma
 
@@ -93,12 +121,11 @@ class HcDownSiluGemm:
                 hc=self.hc,
             )
             extra_args = (M, K, 1)  # runtime N placeholder
-            options = "--enable-tvm-ffi --ptxas-options -maxrregcount=64"
 
         hidden_states = make_fake_tensor(BFloat16, (M, K), divisibility=8)
         router_weight = make_fake_tensor(BFloat16, (N, K), divisibility=8)
         output = make_fake_tensor(BFloat16, (M, N), divisibility=1)
-        self._compiled[compile_key] = cute.compile(
+        return cute.compile(
             gemm,
             hidden_states,
             router_weight,
@@ -107,7 +134,6 @@ class HcDownSiluGemm:
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options=options,
         )
-        logger.debug("Compiled hc_down_silu: %s", compile_key)
 
     def request_warmup(self, m_values: Iterable[int]) -> None:
         m_values = set(m_values)

@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from vllm.distributed import is_global_first_rank
 from vllm.logger import init_logger
+from vllm.model_executor.warmup import cutedsl_aot_cache
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
 
@@ -109,4 +110,14 @@ def cutedsl_warmup() -> None:
         len(compile_units),
         tuple(dict.fromkeys(unit.name for unit in compile_units)),
     )
-    _compile_cutedsl_warmup_units(compile_units)
+    before = cutedsl_aot_cache.snapshot_counters()
+    compiled_units = _compile_cutedsl_warmup_units(compile_units)
+    after = cutedsl_aot_cache.snapshot_counters()
+    # One line after the units: boot_stages.py ends the CuTeDSL stage on it.
+    logger.info(
+        "CuTeDSL warmup: %d units, %d from AOT cache, %d compiled, %d fallbacks",
+        compiled_units,
+        after["hits"] - before["hits"],
+        after["compiled"] - before["compiled"],
+        after["fallbacks"] - before["fallbacks"],
+    )

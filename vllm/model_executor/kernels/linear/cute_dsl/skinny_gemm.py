@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import partial
@@ -120,6 +121,29 @@ class ShapeDynamicSkinnyGemm:
         config: SkinnyGemmConfig,
         has_residual: bool,
     ) -> None:
+        from vllm.model_executor.warmup.cutedsl_aot_cache import cached_cute_compile
+
+        from . import _skinny_gemm
+
+        use_pdl = self._use_pdl()
+        options = "--enable-tvm-ffi --ptxas-options -maxrregcount=64"
+        self._compiled[(dtype, config, has_residual)] = cached_cute_compile(
+            "shape-dynamic-skinny-gemm",
+            (dtype, config, has_residual, use_pdl, options),
+            partial(
+                self._compile_uncached, dtype, config, has_residual, use_pdl, options
+            ),
+            (sys.modules[__name__], _skinny_gemm),
+        )
+
+    def _compile_uncached(
+        self,
+        dtype: torch.dtype,
+        config: SkinnyGemmConfig,
+        has_residual: bool,
+        use_pdl: bool,
+        options: str,
+    ) -> Any:
         import cutlass.cute as cute
         from quack.compile_utils import make_fake_tensor
 
@@ -152,17 +176,17 @@ class ShapeDynamicSkinnyGemm:
             vector_width=config.vector_width,
             k_unroll=config.k_unroll,
             has_residual=has_residual,
-            use_pdl=self._use_pdl(),
+            use_pdl=use_pdl,
             static_k=config.static_k,
         )
-        self._compiled[(dtype, config, has_residual)] = cute.compile(
+        return cute.compile(
             kernel,
             a,
             b,
             residual,
             c,
             self._stream(),
-            options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
+            options=options,
         )
 
     def request_warmup_configs(

@@ -89,7 +89,7 @@ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
 from .ple_disk import Qwen4ExpPLEDiskEmbedding
 from .ple_layer import Qwen4ExpPLELayer
-from .qsa import Qwen4ExpQSAAttention
+from .qsa import Qwen4ExpQSAAttention, indexer_quant_differs
 
 # Transformers v5.18 renamed `qwen_sparse_attention` to `indexed_attention`
 # TODO: Delete qwen_... once Transformers 5.18.0 is the minimum required version.
@@ -738,6 +738,21 @@ class Qwen4ExpModel(nn.Module):
         return loaded
 
 
+def qsa_indexer_unfused_by_quant(
+    quant_config: QuantizationConfig | None,
+    config: Qwen4ExpTextConfig,
+    model_prefix: str,
+) -> bool:
+    """Whether any full-attention layer's quant scheme differs between q_proj
+    and indexer.index_qk_proj (indexer_quant_differs), so the packed
+    ``qkv_proj`` mapping must leave the indexer out for the whole model."""
+    return any(
+        indexer_quant_differs(quant_config, f"{model_prefix}.layers.{i}.self_attn")
+        for i, layer_type in enumerate(config.layer_types or [])
+        if layer_type != "linear_attention"
+    )
+
+
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
@@ -774,6 +789,19 @@ class Qwen4ExpForCausalLM(
             self.packed_modules_mapping = self.packed_modules_mapping | {
                 "qkv_proj": ["q_proj", "k_proj", "v_proj"],
             }
+        elif (
+            quant_config := vllm_config.quant_config
+        ) is not None and qsa_indexer_unfused_by_quant(
+            quant_config, config, maybe_prefix(prefix, "model")
+        ):
+            # Swift-1.5 AWQ: INT4 q/k/v beside a BF16 indexer projection. The quant
+            # config holds the class's mapping by reference (configure_quant_config),
+            # so rebind it to a copy rather than mutate the shared class attribute.
+            unfused = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+            self.packed_modules_mapping = self.packed_modules_mapping | unfused
+            quant_config.packed_modules_mapping = (
+                quant_config.packed_modules_mapping | unfused
+            )
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.quant_config = vllm_config.quant_config

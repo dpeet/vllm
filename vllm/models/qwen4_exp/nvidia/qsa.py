@@ -335,6 +335,33 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         return output
 
 
+def indexer_quant_differs(
+    quant_config: QuantizationConfig | None, attn_prefix: str
+) -> bool:
+    """Whether compressed-tensors ignores exactly one of ``q_proj`` and
+    ``indexer.index_qk_proj`` under ``attn_prefix`` (a ``...self_attn`` path).
+
+    Swift-1.5's W4A16-AWQ quantizes q/k/v_proj to INT4 but keeps the indexer
+    projection BF16, so packing ``indexer.index_qk_proj`` into ``qkv_proj``
+    would mix schemes in one linear, which compressed-tensors refuses. Such a
+    checkpoint keeps the two projections separate, as LoRA does. Checkpoints
+    that quantize both or ignore both (the base AWQ ignores both) and the
+    ModelOpt NVFP4 checkpoints return False and keep the fused projection.
+    """
+    if quant_config is None or quant_config.get_name() != "compressed-tensors":
+        return False
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
+
+    ignore = getattr(quant_config, "ignore", None) or []
+    q_ignored = should_ignore_layer(f"{attn_prefix}.q_proj", ignore)
+    indexer_ignored = should_ignore_layer(
+        f"{attn_prefix}.indexer.index_qk_proj", ignore
+    )
+    return q_ignored != indexer_ignored
+
+
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     """Merged Qwen full-attention owner with a QSA index side branch."""
 
@@ -516,8 +543,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # QWEN38_FP8_DENSE's attn group casts self_attn.qkv_proj by prefix; the
         # fused linear keeps that prefix but also carries the indexer Q/K rows,
         # which stay BF16, so the cast keeps the two projections separate.
+        # A checkpoint that quantizes q/k/v but not the indexer projection (or the
+        # reverse) keeps them separate too (indexer_quant_differs).
         self.fuse_indexer_projection = (
-            vllm_config.lora_config is None and "attn" not in qwen38_fp8_dense_groups()
+            vllm_config.lora_config is None
+            and "attn" not in qwen38_fp8_dense_groups()
+            and not indexer_quant_differs(quant_config, prefix)
         )
         if self.fuse_indexer_projection:
             self.index_qk_size = self.indexer.index_qk_proj.output_size
